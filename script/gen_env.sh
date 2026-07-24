@@ -2,67 +2,96 @@
 set -euo pipefail
 export LC_ALL=C
 
-# ---------- helpers ----------
-rand_hex() {           # N bytes -> hex (2N chars)
-  openssl rand -hex "$1"
-}
-rand_b64_bytes() {     # N bytes -> base64 (single line)
-  openssl rand -base64 "$1" | tr -d '\n'
-}
-rand_alnum() {         # N alnum chars, robust on macOS/BSD
-  local n="$1" out=""
-  while [ "${#out}" -lt "$n" ]; do
-    local need=$(( n - ${#out} ))
-    local chunk
-    chunk="$(openssl rand -base64 $((need*2 + 16)) | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c "$need" || true)"
-    out="${out}${chunk}"
-  done
-  printf '%s' "$out"
+usage() {
+  cat <<'EOF'
+Usage: gen_env.sh [TARGET_DIR] [PROJECT_NAME] [PORT_PREFIX]
+
+Generate a complete .env for a current Supabase Docker installation.
+
+  TARGET_DIR    Directory containing .env.example and utils/ (default: current directory)
+  PROJECT_NAME  Project identifier used by Studio and Supavisor (default: directory name)
+  PORT_PREFIX   Two-digit port prefix, 10-64 (default: 28)
+
+For PORT_PREFIX=28 the exposed ports are:
+  Kong HTTP 28000, Kong HTTPS 28443, Postgres 28432, transaction pooler 28543.
+EOF
 }
 
-# ---------- generate values ----------
-POSTGRES_PASSWORD="$(rand_alnum 16)"                  # 16 alnum
-JWT_SECRET_HEX="$(rand_hex 32)"                       # 32 bytes -> 64 hex chars (HS256 secret)
-SECRET_KEY_BASE="$(rand_b64_bytes 48)"                      # 32 bytes -> 64 hex chars
-VAULT_ENC_KEY="$(rand_hex 16)"                        # 16 bytes -> 32 hex chars (raw 32 chars total)
-PG_META_CRYPTO_KEY="$(rand_b64_bytes 32)"             # base64(32 bytes)
-DASHBOARD_USERNAME="$(rand_alnum 8)"
-DASHBOARD_PASSWORD="$(rand_alnum 16)"
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
 
-# ---------- generate JWTs (Anon / Service Role) ----------
-# Uses Python stdlib only; signs with HS256 using JWT_SECRET_HEX.
-export JWT_SECRET_HEX
-readarray -t JWT_KEYS < <(python3 "$PWD/../../node_agent/utils/jwt_util.py" --secret "$JWT_SECRET_HEX" --mode generate)
-ANON_KEY="${JWT_KEYS[0]}"
-SERVICE_ROLE_KEY="${JWT_KEYS[1]}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+TARGET_DIR="${1:-$PWD}"
+PROJECT_NAME="${2:-$(basename -- "$TARGET_DIR")}"
+PORT_PREFIX="${3:-28}"
 
-# ---------- write .env.local ----------
-cat > .env.local <<ENV
-POSTGRES_PASSWORD=$POSTGRES_PASSWORD
-JWT_SECRET=$JWT_SECRET_HEX
-ANON_KEY=$ANON_KEY
-SERVICE_ROLE_KEY=$SERVICE_ROLE_KEY
-DASHBOARD_USERNAME=$DASHBOARD_USERNAME
-DASHBOARD_PASSWORD=$DASHBOARD_PASSWORD
-SECRET_KEY_BASE=$SECRET_KEY_BASE
-VAULT_ENC_KEY=$VAULT_ENC_KEY
-PG_META_CRYPTO_KEY=$PG_META_CRYPTO_KEY
-ENV
+if [[ ! "$PORT_PREFIX" =~ ^[0-9]{2}$ ]] || (( 10#$PORT_PREFIX < 10 || 10#$PORT_PREFIX > 64 )); then
+  echo "PORT_PREFIX must be a two-digit number from 10 through 64." >&2
+  exit 2
+fi
 
-echo "✅ Generated .env.local"
-cat .env.local
+TARGET_DIR="$(cd -- "$TARGET_DIR" && pwd)"
+ENV_EXAMPLE="$TARGET_DIR/.env.example"
+ENV_FILE="$TARGET_DIR/.env"
 
-# ---------- sanity checks ----------
-echo
-echo "Sanity checks:"
-awk -F= '/^VAULT_ENC_KEY=/{print "VAULT_ENC_KEY length:", length($2)}' .env.local   # expect 32
-awk -F= '/^PG_META_CRYPTO_KEY=/{print $2}' .env.local | awk '{l=length($0)%4; if(l>0) printf "%s%s\n", $0, substr("====",1,4-l); else print $0}' | base64 -d | wc -c | xargs echo "PG_META_CRYPTO_KEY bytes:"
-awk -F= '/^POSTGRES_PASSWORD=/{print "POSTGRES_PASSWORD length:", length($2)}' .env.local   # expect 16
-awk -F= '/^JWT_SECRET=/{print "JWT_SECRET_HEX length:", length($2)}' .env.local             # expect 64
-awk -F= '/^SECRET_KEY_BASE=/{print "SECRET_KEY_BASE length:", length($2)}' .env.local       # expect 64
-awk -F= '/^ANON_KEY=/{print "ANON_KEY length:", length($2)}' .env.local                     # JWT, variable length
-awk -F= '/^SERVICE_ROLE_KEY=/{print "SERVICE_ROLE_KEY length:", length($2)}' .env.local     # JWT, variable length
-awk -F= '/^DASHBOARD_USERNAME=/{print "DASHBOARD_USERNAME length:", length($2)}' .env.local         # expect 8
-awk -F= '/^DASHBOARD_PASSWORD=/{print "DASHBOARD_PASSWORD length:", length($2)}' .env.local # expect 16
+if [[ ! -f "$ENV_EXAMPLE" || ! -f "$TARGET_DIR/utils/generate-keys.sh" ]]; then
+  echo "TARGET_DIR must be a current Supabase docker directory with .env.example and utils/." >&2
+  exit 2
+fi
 
-./check_env.sh .env.local
+cp "$ENV_EXAMPLE" "$ENV_FILE"
+
+(
+  cd "$TARGET_DIR"
+  sh utils/generate-keys.sh --update-env >/dev/null
+  if command -v node >/dev/null 2>&1; then
+    sh utils/add-new-auth-keys.sh --update-env >/dev/null
+  else
+    echo "Note: node is unavailable; generated legacy JWT keys only." >&2
+  fi
+)
+
+python3 - "$ENV_FILE" "$PROJECT_NAME" "$PORT_PREFIX" <<'PY'
+import re
+import secrets
+import sys
+from pathlib import Path
+
+env_path = Path(sys.argv[1])
+project = sys.argv[2]
+prefix = sys.argv[3]
+
+updates = {
+    "DASHBOARD_USERNAME": "supabase",
+    "KONG_HTTP_PORT": f"{prefix}000",
+    "KONG_HTTPS_PORT": f"{prefix}443",
+    "POSTGRES_PORT": f"{prefix}432",
+    "POOLER_PROXY_PORT_TRANSACTION": f"{prefix}543",
+    "POOLER_TENANT_ID": f"{project}-{secrets.token_hex(8)}",
+    "STUDIO_DEFAULT_ORGANIZATION": project,
+    "STUDIO_DEFAULT_PROJECT": project,
+    "SUPABASE_PUBLIC_URL": f"http://localhost:{prefix}000",
+    "API_EXTERNAL_URL": f"http://localhost:{prefix}000/auth/v1",
+    "SITE_URL": f"http://localhost:{prefix}300",
+    "OPENAI_API_KEY": "",
+}
+
+text = env_path.read_text()
+for key, value in updates.items():
+    pattern = rf"(?m)^{re.escape(key)}=.*$"
+    replacement = f"{key}={value}"
+    if re.search(pattern, text):
+        text = re.sub(pattern, replacement, text)
+    else:
+        text += f"\n{replacement}"
+env_path.write_text(text)
+PY
+
+chmod 600 "$ENV_FILE"
+rm -f "$TARGET_DIR/.env.old" "$TARGET_DIR/docker-compose.yml.old"
+
+"$SCRIPT_DIR/check_env.sh" "$ENV_FILE"
+echo "Generated $ENV_FILE for '$PROJECT_NAME'."
+echo "HTTP=${PORT_PREFIX}000 HTTPS=${PORT_PREFIX}443 POSTGRES=${PORT_PREFIX}432 POOLER=${PORT_PREFIX}543"

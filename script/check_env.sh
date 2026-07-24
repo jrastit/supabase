@@ -17,10 +17,34 @@ if [ -z "$JWT_SECRET" ] || [ -z "$ANON_KEY" ] || [ -z "$SERVICE_ROLE_KEY" ]; the
   exit 2
 fi
 
-UTIL_PATH="$(dirname "$0")/../../node_agent/utils/jwt_util.py"
+# Validate HS256 signatures with Python's standard library. This keeps the
+# checker portable and independent from another project's source tree.
+python3 - "$JWT_SECRET" "$ANON_KEY" "$SERVICE_ROLE_KEY" <<'PY'
+import base64
+import hashlib
+import hmac
+import json
+import sys
 
-# Vérification des tokens
-echo "Vérification ANON_KEY :"
-python3 "$UTIL_PATH" --secret "$JWT_SECRET" --mode check --token "$ANON_KEY"
-echo "Vérification SERVICE_ROLE_KEY :"
-python3 "$UTIL_PATH" --secret "$JWT_SECRET" --mode check --token "$SERVICE_ROLE_KEY"
+secret = sys.argv[1].encode()
+for name, token, expected_role in (
+    ("ANON_KEY", sys.argv[2], "anon"),
+    ("SERVICE_ROLE_KEY", sys.argv[3], "service_role"),
+):
+    try:
+        header, payload, signature = token.split(".")
+        expected = hmac.new(
+            secret, f"{header}.{payload}".encode(), hashlib.sha256
+        ).digest()
+        actual = base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4))
+        claims = json.loads(
+            base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+        )
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"{name}: invalid JWT ({exc})")
+    if not hmac.compare_digest(actual, expected):
+        raise SystemExit(f"{name}: invalid signature")
+    if claims.get("role") != expected_role:
+        raise SystemExit(f"{name}: expected role {expected_role!r}")
+    print(f"{name}: valid ({expected_role})")
+PY
